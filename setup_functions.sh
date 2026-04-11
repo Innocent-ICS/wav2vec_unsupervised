@@ -11,7 +11,7 @@ set -x                       # Print each command for debugging
 # Set these variables according to your environment
 
 # Main directories
-INSTALL_ROOT="$HOME/wav2vec_unsupervised"
+INSTALL_ROOT="$/content/drive/MyDrive/wav2vec_unsupervised"
 FAIRSEQ_ROOT="$INSTALL_ROOT/fairseq_"
 KENLM_ROOT="$INSTALL_ROOT/kenlm"
 VENV_PATH="$INSTALL_ROOT/venv"
@@ -40,12 +40,13 @@ command_exists() {
 }
 
 get_system_cuda_suffix() {
-    if ! command -v nvcc --version >/dev/null 2>&1; then
+    if ! command -v nvcc >/dev/null 2>&1; then
         log "ERROR: nvcc (NVIDIA CUDA Compiler) not found in PATH. Cannot determine CUDA version for GPU packages."
         exit 1
     fi
     local cuda_version
     cuda_version=$(nvcc --version | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p')
+    echo "$cuda_version"
 }
 
 # Create home and log directory 
@@ -177,16 +178,48 @@ install_pytorch_and_other_packages() {
     source "$VENV_PATH/bin/activate"
   
     
-    pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url "https://download.pytorch.org/whl/cu121"
+    # Detect CUDA version and select the appropriate PyTorch wheel
+    if command -v nvcc >/dev/null 2>&1; then
+        local detected_cuda
+        detected_cuda=$(get_system_cuda_suffix)
+        # Map detected CUDA version to the nearest available PyTorch wheel suffix
+        local cuda_short
+        cuda_short=$(echo "$detected_cuda" | tr -d '.')  # e.g. "12.1" -> "121"
+        local torch_index_url="https://download.pytorch.org/whl/cu${cuda_short}"
+        log "Detected CUDA $detected_cuda — installing PyTorch with wheel: cu${cuda_short}"
+    else
+        local torch_index_url="https://download.pytorch.org/whl/cpu"
+        log "No CUDA detected — installing CPU-only PyTorch"
+    fi
+
+    # pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url "$torch_index_url"
+
+    # I am moddifying this part to ensure compatibility between torch and cuda across different gpus
+    if [[ "$cuda_short" -ge "128" ]]; then
+      local torch_version="2.7.0"
+      local torchvision_version="0.22.0"
+      local torchaudio_version="2.7.0"
+    elif [[ "$cuda_short" -ge "121" ]]; then
+      local torch_version="2.3.0"
+      local torchvision_version="0.18.0"
+      local torchaudio_version="2.3.0"
+    else
+      local torch_version="2.1.0"
+      local torchvision_version="0.16.0"
+      local torchaudio_version="2.1.0"
+    fi
+
+    pip install torch==${torch_version} torchvision==${torchvision_version} torchaudio==${torchaudio_version} \
+    --index-url "$torch_index_url"
 
     # Install other required packages
     pip install "numpy<2" scipy tqdm sentencepiece soundfile librosa editdistance tensorboardX packaging soundfile
     pip install npy-append-array h5py kaldi-io g2p_en
 
-    if ! command -v nvcc --version >/dev/null 2>&1; then
-         pip install faiss-cpu
-    else
+    if command -v nvcc >/dev/null 2>&1; then
         pip install faiss-gpu
+    else
+        pip install faiss-cpu
     fi
     
     pip install ninja
@@ -330,28 +363,31 @@ install_flashlight() {
     local flashlight_python_flag="-DFLASHLIGHT_BUILD_PYTHON=ON" # <--- CHECK THIS FLAG!
     log "[INFO] Using CMake flag for Python bindings: $flashlight_python_flag (Verify this is correct!)"
 
-    export USE_CUDA=1 # Set if building for CUDA
+    # Default to CUDA-enabled build; fall back to CPU if nvcc is absent
+    local use_cuda_flag="-DFLASHLIGHT_USE_CUDA=ON"
+    export USE_CUDA=1
 
     if ! command -v nvcc &> /dev/null; then
         log "[INFO] nvcc not found. Switching to CPU-only build."
         use_cuda_flag="-DFLASHLIGHT_USE_CUDA=OFF"
         export USE_CUDA=0
+    fi
+
     # Explicitly point CMake to the Python executable in the venv for robustness
     local python_executable="$VENV_PATH/bin/python"
     cmake .. -DCMAKE_BUILD_TYPE=Release \
              -DPYTHON_EXECUTABLE="$python_executable" \
              "$flashlight_python_flag" \
-             "$use_cuda_flag" \
+             "$use_cuda_flag"
 
     # Build the C++ library AND Python bindings
     log "Building Flashlight sequence (C++ and Python)..."
-    cmake --build . --config Release --parallel "$(nproc)" \
-     
+    cmake --build . --config Release --parallel "$(nproc)"
+
     # Install the Python Bindings into the ACTIVE virtual environment
     log "Installing Flashlight sequence Python bindings into venv..."
-    # This assumes setup.py or similar is generated in the build directory.
     cd ..
-    pip install . \
+    pip install .
 
     log "[PASS] Flashlight Python bindings installed via pip."
 

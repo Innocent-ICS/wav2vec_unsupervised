@@ -1,0 +1,54 @@
+
+# Python virtual environment - large, machine-specific
+venv/
+
+# Installed dependencies - cloned and built by setup script
+fairseq_/
+kenlm/
+rVADfast/
+sequence/
+
+# Downloaded models - large binary files, re-downloadable
+pre-trained/
+lid_model/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Logs generated during runs
+logs/
+*.log
+
+# Jupyter/Colab notebook checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# Audio data - likely large, should be managed separately
+*.wav
+*.flac
+*.mp3
+*.ogg
+
+# Training outputs and checkpoints - large, regeneratable
+checkpoints/
+outputs/
+results/
+*.pt
+*.pth
+*.bin
+
+# KenLM binary models
+*.arpa
+*.arpa.bin
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.python-version
