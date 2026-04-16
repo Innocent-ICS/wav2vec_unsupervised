@@ -2,27 +2,39 @@
 
 # ==================== CONFIGURATION ====================
 # Set these variables according to your environment and needs
+# Adapted for macOS Apple Silicon M2 (arm64)
+
+# Detect script directory robustly (works whether sourced or run directly)
+if [[ -n "${BASH_SOURCE[0]}" ]]; then
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    _SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
 
 # Main directories
-#.... directories to add to root.......
-DIR_PATH="$HOME/wav2vec_unsupervised" # the root directory of the project
-DATA_ROOT="$DIR_PATH/data" # a folder that stores all the data generated from pipeline
-FAIRSEQ_ROOT="$DIR_PATH/fairseq_" # the root directory of the fairseq repository
-KENLM_ROOT="$DIR_PATH/kenlm/build/bin"  # Path to KenLM installation
-VENV_PATH="$DIR_PATH/venv"    # Path to virtual environment (optional)
-RVAD_ROOT="$DIR_PATH/rVADfast/src/rVADfast" # the root directory of the rVADfast repository
+DIR_PATH="${_SCRIPT_DIR}"             # root of the project (local Mac path)
+DATA_ROOT="$DIR_PATH/data"            # stores all generated pipeline data
+FAIRSEQ_ROOT="$DIR_PATH/fairseq_"    # fairseq repository root
+KENLM_ROOT="$DIR_PATH/kenlm/build/bin"  # KenLM compiled binaries
+VENV_PATH="$DIR_PATH/venv"           # Python virtual environment
+RVAD_ROOT="$DIR_PATH/rVADfast/src/rVADfast"  # rVADfast source root
+
+# Homebrew prefix (Apple Silicon default)
+BREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+
+# Python command (macOS venv uses python3)
+PYTHON="python3"
 
 GANS_OUTPUT_PHONES="$DATA_ROOT/transcription_phones"
 
 
-
 # ==================== HELPER FUNCTIONS ====================
 
-#fairseq file paths with slight changes made 
+# Fairseq file paths (with any project-specific patches)
 SPEECHPROCS="$DIR_PATH/rVADfast/src/rVADfast/speechproc/speechproc.py"
 PREPARE_AUDIO="$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/prepare_audio.sh"
 ADD_SELF_LOOP_SIMPLE="$FAIRSEQ_ROOT/examples/speech_recognition/kaldi/add-self-loop-simple.cc"
-OPENFST_PATH="$DIR_PATH/fairseq/examples/speech_recognition/kaldi/kaldi_initializer.py"
+OPENFST_PATH="$FAIRSEQ_ROOT/examples/speech_recognition/kaldi/kaldi_initializer.py"
 
 
 # Arguments/variables
@@ -32,36 +44,36 @@ NEW_BATCH_SIZE=32
 PHONEMIZER="G2P"
 LANG="en"
 
-#models 
-FASTTEXT_LIB_MODEL="$DIR_PATH/lid_model/lid.176.bin"  # the path to the language identification model
-MODEL="$DIR_PATH/pre-trained/wav2vec_vox_new.pt" # the path to the pre-trained wav2vec model for audio feature extraction
+# Models
+FASTTEXT_LIB_MODEL="$DIR_PATH/lid_model/lid.176.bin"
+MODEL="$DIR_PATH/pre-trained/wav2vec_vox_new.pt"
 
 # Dataset specifics
 DATASET_NAME="librispeech"
 
 # Output directories (will be created if they don't exist)
-MANIFEST_DIR="$DATA_ROOT/manifests" # the directory that stores the manifest files for the audio dataset
-NONSIL_AUDIO="$DATA_ROOT/processed_audio/" #the directory that stores the audio files with silence removed 
-MANIFEST_NONSIL_DIR="$DATA_ROOT/manifests_nonsil" #the directory that stores the manifest files foe audio dataset with silence removed
-CLUSTERING_DIR="$DATA_ROOT/clustering/$DATASET_NAME"  #stores the output of audio processing, the psuedophonemes(cluster IDs), Audio features
-RESULTS_DIR="$DATA_ROOT/results/$DATASET_NAME" # Stores all the training information of the gans
-CHECKPOINT_DIR="$DATA_ROOT/checkpoints/$DATASET_NAME" # stores the progress checkpoint file which keeps track of processes implemented 
-LOG_DIR="$DATA_ROOT/logs/$DATASET_NAME" #stores the pipeline logs 
-TEXT_OUTPUT="$DATA_ROOT/text" # stores the processes output from the prepared text function 
+MANIFEST_DIR="$DATA_ROOT/manifests"
+NONSIL_AUDIO="$DATA_ROOT/processed_audio/"
+MANIFEST_NONSIL_DIR="$DATA_ROOT/manifests_nonsil"
+CLUSTERING_DIR="$DATA_ROOT/clustering/$DATASET_NAME"
+RESULTS_DIR="$DATA_ROOT/results/$DATASET_NAME"
+CHECKPOINT_DIR="$DATA_ROOT/checkpoints/$DATASET_NAME"
+LOG_DIR="$DATA_ROOT/logs/$DATASET_NAME"
+TEXT_OUTPUT="$DATA_ROOT/text"
 
-
-# Checkpoint file to track progress
+# Checkpoint file to track pipeline progress
 CHECKPOINT_FILE="$CHECKPOINT_DIR/progress.checkpoint"
 
 
-# Log message with timestamp
+# ==================== CHECKPOINT HELPERS ====================
+
 log() {
     local message="$1"
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    mkdir -p "$LOG_DIR"
     echo "[$timestamp] $message" | tee -a "$LOG_DIR/pipeline.log"
 }
 
-# Check if a step has been completed
 is_completed() {
     local step="$1"
     if [ -f "$CHECKPOINT_FILE" ]; then
@@ -70,7 +82,6 @@ is_completed() {
     return 1
 }
 
-# Check if a step is in progress (for recovery after crash)
 is_in_progress() {
     local step="$1"
     if [ -f "$CHECKPOINT_FILE" ]; then
@@ -79,46 +90,48 @@ is_in_progress() {
     return 1
 }
 
-# Mark a step as completed
 mark_completed() {
     local step="$1"
     echo "$step:COMPLETED" >> "$CHECKPOINT_FILE"
     log "Marked step '$step' as completed"
 }
 
-# Mark a step as in progress
 mark_in_progress() {
     local step="$1"
-    # First remove any existing in-progress markers for this step
     if [ -f "$CHECKPOINT_FILE" ]; then
-        sed -i "/^$step:IN_PROGRESS$/d" "$CHECKPOINT_FILE"
+        # macOS-compatible sed: requires empty string after -i
+        sed -i '' "/^$step:IN_PROGRESS$/d" "$CHECKPOINT_FILE"
     fi
     echo "$step:IN_PROGRESS" >> "$CHECKPOINT_FILE"
     log "Marked step '$step' as in progress"
 }
 
+
+# ==================== ENV HELPERS ====================
+
 setup_path() {
     export HYDRA_FULL_ERROR=1
-    export LD_LIBRARY_PATH="${KALDI_ROOT}/src/lib:${KENLM_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+    # On macOS, no LD_LIBRARY_PATH equivalent needed for KenLM/fairseq
+    # DYLD_LIBRARY_PATH is used on macOS but fairseq finds libs via pip install
+    export KENLM_ROOT="$KENLM_ROOT"
+    export FAIRSEQ_ROOT="$FAIRSEQ_ROOT"
+    export RVAD_ROOT="$RVAD_ROOT"
 }
 
-
-# Activate virtual environment if provided
-
 activate_venv() {
-    if [ -n "$VENV_PATH" ]; then
+    if [ -n "$VENV_PATH" ] && [ -f "$VENV_PATH/bin/activate" ]; then
         log "Activating virtual environment at $VENV_PATH"
         source "$VENV_PATH/bin/activate"
+        # After activation, 'python3' should be available
+        PYTHON="python3"
+    else
+        log "WARNING: Virtual environment not found at $VENV_PATH"
     fi
 }
 
-
-# Create directories if they don't exist
+# Create all necessary directories
 create_dirs() {
     mkdir -p "$MANIFEST_DIR" "$CLUSTERING_DIR" "$MANIFEST_NONSIL_DIR" \
-             "$RESULTS_DIR" "$CHECKPOINT_DIR" "$LOG_DIR" "$TEXT_OUTPUT" "$GANS_OUTPUT_PHONES"
+             "$RESULTS_DIR" "$CHECKPOINT_DIR" "$LOG_DIR" "$TEXT_OUTPUT" \
+             "$GANS_OUTPUT_PHONES" "$NONSIL_AUDIO"
 }
-
-
-
-

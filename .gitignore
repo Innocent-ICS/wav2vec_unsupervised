@@ -12,6 +12,9 @@ sequence/
 pre-trained/
 lid_model/
 
+#personal learning
+Learning/
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -52,3 +55,9 @@ Thumbs.db
 # Environment files
 .env
 .python-version
+
+# Datasets and generated evaluation clusters
+data/
+
+# Hydra multi-run logs
+multirun/

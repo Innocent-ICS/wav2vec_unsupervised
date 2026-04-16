@@ -1,32 +1,45 @@
 #!/bin/bash
 
-# This script holds all the functions and libraries needed a successful setup 
-# that ensure a smooth running of the fairseq wav2vec unsupervised pipeline
+# ==================== SETUP FUNCTIONS (macOS Apple Silicon) ====================
+# Adapted from the original Google Colab / Linux / NVIDIA GPU version.
+# This version targets macOS M2 arm64, using Homebrew and the MPS backend.
 
-set -e                       # Exit on error
-set -o pipefail              # Exit if any command in a pipe fails
-set -x                       # Print each command for debugging
+set -e
+set -o pipefail
 
-# ==================== CONFIGURATION ====================
-# Set these variables according to your environment
+# Source utils for paths and helpers
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/utils.sh"
 
-# Main directories
-INSTALL_ROOT="$/content/drive/MyDrive/wav2vec_unsupervised"
-FAIRSEQ_ROOT="$INSTALL_ROOT/fairseq_"
-KENLM_ROOT="$INSTALL_ROOT/kenlm"
-VENV_PATH="$INSTALL_ROOT/venv"
-RVADFAST_ROOT="$INSTALL_ROOT/rVADfast"
-FLASHLIGHT_SEQ_ROOT="$INSTALL_ROOT/sequence"
+# ---- Ensure Homebrew is on PATH (Apple Silicon default: /opt/homebrew) ----
+# The IDE / non-login shell may not have /opt/homebrew/bin in PATH.
+BREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+export PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:${PATH}"
+
+INSTALL_ROOT="$DIR_PATH"
+PYTHON_VERSION="3.11"
+
+# Python 3.11 is required — fairseq + hydra-core 1.0.7 use a dataclass pattern
+# that Python 3.12 broke (mutable defaults). Python 3.11 is fully compatible.
+# Homebrew 3.11 is preferred; falls back to 3.10 if needed.
+if [ -x "${BREW_PREFIX}/bin/python3.11" ]; then
+    PYTHON312="${BREW_PREFIX}/bin/python3.11"
+elif [ -x "${BREW_PREFIX}/bin/python3.10" ]; then
+    PYTHON312="${BREW_PREFIX}/bin/python3.10"
+    PYTHON_VERSION="3.10"
+elif [ -x "/usr/local/bin/python3.11" ]; then
+    PYTHON312="/usr/local/bin/python3.11"
+else
+    echo "ERROR: Python 3.11 not found. Install with: brew install python@3.11"
+    exit 1
+fi
+
+# Homebrew binary (explicit path as fallback)
+BREW="${BREW_PREFIX}/bin/brew"
 
 
-# Python version
-PYTHON_VERSION="3.10"  # Options: 3.7, 3.8, 3.9, 3.10
-CUDA="12.3"
+# ==================== HELPER ====================
 
-
-# ==================== HELPER FUNCTIONS ====================
-
-# Log message with timestamp
 log() {
     local message="$1"
     local timestamp
@@ -34,235 +47,249 @@ log() {
     echo "[$timestamp] $message"
 }
 
-# Check if a command exists
 command_exists() {
-    command -v "$1" >/dev/null 2>&1
+    command -v "$1" > /dev/null 2>&1
 }
 
-get_system_cuda_suffix() {
-    if ! command -v nvcc >/dev/null 2>&1; then
-        log "ERROR: nvcc (NVIDIA CUDA Compiler) not found in PATH. Cannot determine CUDA version for GPU packages."
+
+# ==================== STEP 1: Basic System Dependencies (macOS) ====================
+
+basic_dependencies() {
+    log "Installing system dependencies via Homebrew..."
+
+    if ! command_exists brew; then
+        log "ERROR: Homebrew not found at $BREW_PREFIX. Install from https://brew.sh"
         exit 1
     fi
-    local cuda_version
-    cuda_version=$(nvcc --version | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p')
-    echo "$cuda_version"
-}
 
-# Create home and log directory 
-create_dirs() {
-    mkdir -p "$INSTALL_ROOT"
-    mkdir -p "$INSTALL_ROOT/logs"
-}
+    # Core build tools + libraries needed for KenLM, flashlight, fairseq
+    $BREW install cmake wget git ninja pkg-config zlib || true
+    $BREW install boost eigen || true
+    $BREW install sentencepiece || true
 
-
-# ==================== SETUP STEPS ====================
-setup_venv() {
-    log "Setting up Python virtual environment..."
-    
-     #setting up pyenv to tackle linkage errors, protobuf requires a python environment which is not static 
-    export PYENV_ROOT="$HOME/.pyenv"
-
-    # Install pyenv ONLY if not already installed
-    if [ ! -d "$PYENV_ROOT" ]; then
-        curl -fsSL https://pyenv.run | bash
-            export PYENV_ROOT="$HOME/.pyenv"
-            [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
-            eval "$(pyenv init - bash)"
-        echo "Detected Python version: $PYTHON_VERSION"
-        env PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install $PYTHON_VERSION
-        pyenv local $PYTHON_VERSION
+    # espeak-ng is used as the phonemizer (replaces espeak for macOS)
+    if ! command_exists espeak-ng; then
+        log "Installing espeak-ng..."
+        $BREW install espeak-ng || log "WARNING: espeak-ng install failed. G2P phonemizer will be used instead."
     else
-        log "Python $PYENV_ROOT already installed."
+        log "espeak-ng already installed."
     fi
-   
-    
-    if [ -d "$VENV_PATH" ]; then
-        log "Virtual environment already exists at $VENV_PATH"
-    else
-        # python${PYTHON_VERSION} -m venv "$VENV_PATH"
-        python3 -m venv "$VENV_PATH"
-        log "Created virtual environment at $VENV_PATH"
-    fi
-    
-    # Activate virtual environment
-    source "$VENV_PATH/bin/activate"
 
-    log "Python virtual environment setup completed."
+    log "System dependencies installed."
 }
 
-#installing_python_basic_dependencies
-basic_dependencies(){
-    sudo apt-get update
-    # Install Python 3, pip, and essential development packages (for compiling C extensions)
-    sudo apt-get install -y python3 python3-pip python3-dev build-essential 
-    sudo apt-get install autoconf automake cmake curl g++ git graphviz libatlas3-base libtool make pkg-config subversion unzip wget zlib1g-dev gfortran
-    sudo apt update
-    sudo apt install -y build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncursesw5-dev xz-utils tk-dev libffi-dev liblzma-dev wget curl
-    sudo apt install software-properties-common
 
-}
-
-# This function installs the cuda version suited for your machine
+# ==================== STEP 2: GPU — macOS uses MPS, not CUDA ====================
 
 cuda_installation() {
-    local cmd_file="cuda_installation.txt"
+    log "INFO: CUDA is not available on Apple Silicon M2."
+    log "INFO: PyTorch MPS (Metal Performance Shaders) will be used instead."
+    log "INFO: Skipping CUDA installation."
+}
 
-    if [[ -f "$cmd_file" ]]; then
-        echo "Starting installation from $cmd_file..."
-
-        source "$cmd_file"
-
-        # Add CUDA to PATH safely (without expanding PATH immediately)
-        echo 'export PATH=/usr/local/cuda-'"$CUDA"'/bin:$PATH' >> ~/.bashrc
-        echo 'export LD_LIBRARY_PATH=/usr/local/cuda-'"$CUDA"'/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-        # Apply immediately to current shell
-        export PATH="/usr/local/cuda-$CUDA/bin:$PATH"
-        export LD_LIBRARY_PATH="/usr/local/cuda-$CUDA/lib64:$LD_LIBRARY_PATH"
-
-        source ~/.bashrc
-
-        echo "CUDA environment variables configured."
-    else
-        echo "Error: $cmd_file not found!"
-        return 1
-    fi
+gpu_drivers_installation() {
+    log "INFO: NVIDIA GPU drivers are not applicable on macOS Apple Silicon."
+    log "INFO: Metal GPU support is built into macOS — no drivers to install."
 }
 
 
-#Installation of gpu drivers and toolkit
-gpu_drivers_installation(){
- echo "--- Starting GPU Driver and Toolkit Installation ---"
-    # 1. Download Google Cloud GPU installation script
-    echo "1. Downloading GCP GPU driver installation script..."
-    curl -s -O https://raw.githubusercontent.com/GoogleCloudPlatform/compute-gpu-installation/main/linux/install_gpu_driver.py
+# ==================== STEP 3: Python Virtual Environment ====================
 
-    # 2. Run the installation script
-    echo "2. Running GPU driver installation script"
-    sudo python3 install_gpu_driver.py
+setup_venv() {
+    log "Setting up Python virtual environment..."
+    log "Using Python binary: $PYTHON312 ($( $PYTHON312 --version 2>&1))"
+    local EXPECTED_MAJOR_MINOR
+    EXPECTED_MAJOR_MINOR=$("$PYTHON312" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-    # 3. Update package lists
-    echo "3. Updating package lists..."
-    sudo apt-get update -y
+    # ---- Detect broken venv ----
+    # The Colab-era venv has bin/python3 as a plain text file containing a
+    # bare path (e.g. "/usr/bin/python3") rather than a proper symlink or
+    # Python executable. We detect this by:
+    #   1. Checking the 'executable' entry in pyvenv.cfg matches our expected Python
+    #   2. Verifying bin/python3 is actually an ELF/Mach-O binary, not a text wrapper
+    local VENV_FUNCTIONAL=false
 
-    # --- 4. Verify nvidia-smi and Fix PATH if necessary ---
-    echo "4. Verifying installation location and fixing PATH..."
+    if [ -f "$VENV_PATH/pyvenv.cfg" ] && [ -f "$VENV_PATH/bin/python3" ]; then
+        # Read the Python executable recorded in pyvenv.cfg
+        local CFG_EXECUTABLE
+        CFG_EXECUTABLE=$(grep '^executable' "$VENV_PATH/pyvenv.cfg" | awk '{print $3}')
+        local CFG_VERSION
+        CFG_VERSION=$(grep '^version' "$VENV_PATH/pyvenv.cfg" | awk '{print $3}' | cut -d. -f1-2)
 
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        echo ""
-        echo "=================================================================="
-        echo "SUCCESS: 'nvidia-smi' is now found and running the command:"
-        nvidia-smi
-        echo "=================================================================="
-    else
-        echo ""
-        echo "=================================================================="
-        echo "FAILURE: 'nvidia-smi' is not found in the initial system PATH."
-        
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            echo "SUCCESS: PATH fix worked! Running the command:"
-            nvidia-smi
-            echo "=================================================================="
+        # Check if bin/python3 is a real binary (Mach-O) or a text wrapper
+        local FILE_TYPE
+        FILE_TYPE=$(file "$VENV_PATH/bin/python3" 2>/dev/null)
+        local IS_BINARY=false
+        if echo "$FILE_TYPE" | grep -qiE "Mach-O|ELF|symbolic link"; then
+            IS_BINARY=true
+        fi
+
+        log "  pyvenv.cfg executable : $CFG_EXECUTABLE"
+        log "  pyvenv.cfg version    : $CFG_VERSION"
+        log "  bin/python3 type      : $FILE_TYPE"
+        log "  Is binary/symlink     : $IS_BINARY"
+        log "  Expected version      : $EXPECTED_MAJOR_MINOR"
+
+        if [ "$IS_BINARY" = true ] && [ "$CFG_VERSION" = "$EXPECTED_MAJOR_MINOR" ]; then
+            VENV_FUNCTIONAL=true
+            log "Existing venv is functional"
         else
-            echo "CRITICAL FAILURE: Driver utilities are missing or severely misconfigured."
-            echo "A system reboot may be required to fully activate the newly installed driver."
-            echo "=================================================================="
+            log "Existing venv is broken (text wrapper or wrong Python version) — will rebuild"
         fi
     fi
+
+    if [ "$VENV_FUNCTIONAL" = false ]; then
+        if [ -d "$VENV_PATH" ]; then
+            local BACKUP_DIR="${VENV_PATH}_backup_$(date +%Y%m%d%H%M%S)"
+            log "Backing up broken venv to $BACKUP_DIR ..."
+            mv "$VENV_PATH" "$BACKUP_DIR"
+        fi
+        log "Creating fresh venv with $PYTHON312 ..."
+        "$PYTHON312" -m venv "$VENV_PATH"
+        log "Fresh venv created."
+    fi
+
+    # Always use the venv's own pip — never the system pip (avoids PEP 668)
+    source "$VENV_PATH/bin/activate"
+    "$VENV_PATH/bin/pip3" install --upgrade pip
+    log "Python virtual environment ready: $(python3 --version)"
 }
 
-# Install PyTorch and related packages
+
+# ==================== STEP 4: PyTorch for Apple Silicon (MPS) ====================
+
 install_pytorch_and_other_packages() {
-    log "Installing PyTorch and related packages..."
+    log "Installing PyTorch and related packages for Apple Silicon..."
     source "$VENV_PATH/bin/activate"
-  
-    
-    # Detect CUDA version and select the appropriate PyTorch wheel
-    if command -v nvcc >/dev/null 2>&1; then
-        local detected_cuda
-        detected_cuda=$(get_system_cuda_suffix)
-        # Map detected CUDA version to the nearest available PyTorch wheel suffix
-        local cuda_short
-        cuda_short=$(echo "$detected_cuda" | tr -d '.')  # e.g. "12.1" -> "121"
-        local torch_index_url="https://download.pytorch.org/whl/cu${cuda_short}"
-        log "Detected CUDA $detected_cuda — installing PyTorch with wheel: cu${cuda_short}"
+
+    "$VENV_PATH/bin/pip3" install --upgrade pip
+
+    # PyTorch 2.x ships MPS-enabled wheels for Apple Silicon by default
+    # Use the standard index (NOT the CUDA cu* wheels)
+    log "Installing PyTorch 2.3.0 (Apple Silicon MPS build)..."
+    "$VENV_PATH/bin/pip3" install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0
+
+    # Verify MPS is available
+    python3 -c "
+import torch
+print(f'PyTorch version: {torch.__version__}')
+print(f'MPS available:   {torch.backends.mps.is_available()}')
+print(f'MPS built-in:    {torch.backends.mps.is_built()}')
+if torch.backends.mps.is_available():
+    print('✅ MPS backend ready — GPU acceleration enabled via Metal')
+else:
+    print('⚠️  MPS not available — will use CPU')
+"
+
+    # Core numeric / audio packages
+    "$VENV_PATH/bin/pip3" install "numpy<2" scipy tqdm sentencepiece soundfile librosa editdistance
+    "$VENV_PATH/bin/pip3" install tensorboardX packaging npy-append-array h5py g2p_en
+
+    # faiss-cpu (faiss-gpu not available on macOS arm64)
+    "$VENV_PATH/bin/pip3" install faiss-cpu
+
+    # ninja for C extensions
+    "$VENV_PATH/bin/pip3" install ninja
+
+    # NLTK data (for G2P phonemizer) — fix macOS SSL cert issue first
+    # Python.org macOS installers don't use system certs; run the bundled installer
+    CERT_CMD="/Applications/Python 3.12/Install Certificates.command"
+    if [ -f "$CERT_CMD" ]; then
+        bash "$CERT_CMD" > /dev/null 2>&1 || true
     else
-        local torch_index_url="https://download.pytorch.org/whl/cpu"
-        log "No CUDA detected — installing CPU-only PyTorch"
+        # Fallback: install certifi and point SSL to it
+        "$VENV_PATH/bin/pip3" install certifi || true
+        export SSL_CERT_FILE=$("$VENV_PATH/bin/python3" -c "import certifi; print(certifi.where())" 2>/dev/null) || true
     fi
-
-    # pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 --index-url "$torch_index_url"
-
-    # I am moddifying this part to ensure compatibility between torch and cuda across different gpus
-    if [[ "$cuda_short" -ge "128" ]]; then
-      local torch_version="2.7.0"
-      local torchvision_version="0.22.0"
-      local torchaudio_version="2.7.0"
-    elif [[ "$cuda_short" -ge "121" ]]; then
-      local torch_version="2.3.0"
-      local torchvision_version="0.18.0"
-      local torchaudio_version="2.3.0"
-    else
-      local torch_version="2.1.0"
-      local torchvision_version="0.16.0"
-      local torchaudio_version="2.1.0"
-    fi
-
-    pip install torch==${torch_version} torchvision==${torchvision_version} torchaudio==${torchaudio_version} \
-    --index-url "$torch_index_url"
-
-    # Install other required packages
-    pip install "numpy<2" scipy tqdm sentencepiece soundfile librosa editdistance tensorboardX packaging soundfile
-    pip install npy-append-array h5py kaldi-io g2p_en
-
-    if command -v nvcc >/dev/null 2>&1; then
-        pip install faiss-gpu
-    else
-        pip install faiss-cpu
-    fi
-    
-    pip install ninja
-    pip install torchcodec
-    sudo apt install zsh
-    python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng')" # we install this to efficiently use the phonemizer G2p
+    "$VENV_PATH/bin/python3" -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', quiet=True)" || true
+    "$VENV_PATH/bin/python3" -c "import nltk; nltk.download('cmudict', quiet=True)" || true
 
     log "PyTorch and related packages installed successfully."
 }
 
-# Clone and install fairseq
+
+# ==================== STEP 5: Fairseq ====================
+
 install_fairseq() {
     log "--- Installing fairseq ---"
-    log "Activating virtual environment: $VENV_PATH"
     source "$VENV_PATH/bin/activate"
-     pip install "pip==24.0"
-    # source "$VENV_PATH/bin/activate"
+
+    "$VENV_PATH/bin/pip3" install "pip>=24.0"
+    "$VENV_PATH/bin/pip3" install "cython<3.0"
+    "$VENV_PATH/bin/pip3" install "setuptools>=40.8.0" wheel
+
+    # ---- omegaconf 2.0.6 compatibility fix ----
+    # pip>=24.1 rejects omegaconf 2.0.6 due to invalid PyYAML>=5.1.* metadata.
+    # Fix: download the wheel, patch the metadata, repack with the correct name.
+    log "Patching and installing omegaconf 2.0.6..."
+    local OMEGACONF_WHL="/tmp/omegaconf-2.0.6-py3-none-any.whl"  # MUST keep full wheel name
+    local OMEGACONF_PATCH="/tmp/omegaconf_patch"
+
+    wget -q "https://files.pythonhosted.org/packages/d0/eb/9d63ce09dd8aa85767c65668d5414958ea29648a0eec80a4a7d311ec2684/omegaconf-2.0.6-py3-none-any.whl" \
+        -O "$OMEGACONF_WHL" \
+        || { log "[ERROR] Failed to download omegaconf wheel."; exit 1; }
+
+    rm -rf "$OMEGACONF_PATCH" && mkdir -p "$OMEGACONF_PATCH"
+    cd "$OMEGACONF_PATCH"
+    unzip -q "$OMEGACONF_WHL"
+
+    # macOS sed requires '' after -i
+    sed -i '' 's/PyYAML (>=5\.1\.\*)/PyYAML (>=5.1)/' omegaconf-2.0.6.dist-info/METADATA
+
+    # Repack — destination must use the full wheel filename for pip to accept it
+    zip -q -r "$OMEGACONF_WHL" .
+    cd "$INSTALL_ROOT"
+    rm -rf "$OMEGACONF_PATCH"
+
+    "$VENV_PATH/bin/pip3" install "$OMEGACONF_WHL" --no-deps \
+        || { log "[ERROR] Failed to install patched omegaconf."; exit 1; }
+
+    "$VENV_PATH/bin/pip3" install "PyYAML>=5.1"
+    "$VENV_PATH/bin/pip3" install "hydra-core==1.0.7" --no-deps
+    "$VENV_PATH/bin/pip3" install "antlr4-python3-runtime==4.8"
+    # ---- end omegaconf fix ----
+
+    "$VENV_PATH/bin/pip3" install "numpy<2"
 
     cd "$INSTALL_ROOT"
 
     if [ -d "$FAIRSEQ_ROOT" ]; then
-        log "fairseq repository already exists. Pulling latest changes..."
+        log "fairseq repository already exists at $FAIRSEQ_ROOT"
         cd "$FAIRSEQ_ROOT"
-        git pull || { log "[WARN] Failed to pull latest fairseq changes. Continuing with existing version."; }
     else
         log "Cloning fairseq repository..."
-        # git clone https://github.com/facebookresearch/fairseq.git "$FAIRSEQ_ROOT" \
-        git clone https://github.com/Ashesi-Org/fairseq_.git "$FAIRSEQ_ROOT" || { log "[ERROR] Failed to clone fairseq repository."; exit 1; }
+        git clone https://github.com/Ashesi-Org/fairseq_.git "$FAIRSEQ_ROOT" \
+            || { log "[ERROR] Failed to clone fairseq."; exit 1; }
         cd "$FAIRSEQ_ROOT"
     fi
 
-    log "Installing fairseq in editable mode..."
-    pip install --editable ./ \
-        || { log "[ERROR] Failed to install fairseq in editable mode."; exit 1; }
+    log "Installing fairseq in editable mode (pure-Python, no C extensions)..."
+    # fairseq's C++/CUDA extensions (libbleu, libnat, etc.) fail on macOS ARM64.
+    # We patched setup.py to respect SKIP_EXTENSIONS=1 which skips all ext_modules.
+    # wav2vec-U GAN training only needs the pure-Python fairseq components.
+    cd "$FAIRSEQ_ROOT"
 
-    # Install wav2vec specific requirements if the file exists
+    local FAIRSEQ_BUILD_LOG="/tmp/fairseq_build.log"
+
+    if SKIP_EXTENSIONS=1 CUDA_HOME="" \
+        "$VENV_PATH/bin/pip3" install --editable ./ --no-deps --no-build-isolation \
+        > "$FAIRSEQ_BUILD_LOG" 2>&1; then
+        log "✅ fairseq installed successfully (pure-Python mode)."
+        tail -3 "$FAIRSEQ_BUILD_LOG"
+    else
+        log "[ERROR] fairseq install failed even with SKIP_EXTENSIONS=1."
+        tail -20 "$FAIRSEQ_BUILD_LOG"
+        exit 1
+    fi
+
+    cd "$INSTALL_ROOT"
+    "$VENV_PATH/bin/pip3" install sacrebleu bitarray tensorboardX
+
     local wav2vec_req_file="$FAIRSEQ_ROOT/examples/wav2vec/requirements.txt"
     if [ -f "$wav2vec_req_file" ]; then
-        log "Installing wav2vec specific requirements from $wav2vec_req_file..."
-        pip install -r "$wav2vec_req_file" \
-            || { log "[WARN] Failed to install some wav2vec requirements. Check $wav2vec_req_file."; }
-    else
-        log "[INFO] No specific requirements file found at $wav2vec_req_file."
+        log "Installing wav2vec specific requirements..."
+        "$VENV_PATH/bin/pip3" install -r "$wav2vec_req_file" \
+            || log "[WARN] Some wav2vec requirements failed."
     fi
 
     log "fairseq installed successfully."
@@ -270,169 +297,127 @@ install_fairseq() {
 }
 
 
-#Install rVADfast for audio silence removal
+# ==================== STEP 6: rVADfast ====================
+
 install_rVADfast() {
-    log "Cloning and installing rVADfast..."
+    log "Installing rVADfast..."
     cd "$INSTALL_ROOT"
-    
     source "$VENV_PATH/bin/activate"
 
-    if [ -d "$RVADFAST_ROOT" ]; then
-        log "rVADfast already exists. Updating..."
-        cd "$RVADFAST_ROOT"
-        git pull
+    if [ -d "$DIR_PATH/rVADfast" ]; then
+        log "rVADfast already cloned. Trying to update..."
+        cd "$DIR_PATH/rVADfast"
+        git pull || log "[WARN] Could not pull rVADfast updates."
     else
-        log "Cloning rVADfast repository..."
-        git clone https://github.com/zhenghuatan/rVADfast.git "$RVADFAST_ROOT"
-        cd "$RVADFAST_ROOT"
+        git clone https://github.com/zhenghuatan/rVADfast.git "$DIR_PATH/rVADfast"
+        cd "$DIR_PATH/rVADfast"
     fi
 
-    mkdir -p "$RVADFAST_ROOT/src"
-    
-    log "rVADfast installed successfully."
+    mkdir -p "$DIR_PATH/rVADfast/src"
+    log "rVADfast ready."
 }
 
-#  Clone and build KenLM
+
+# ==================== STEP 7: KenLM (macOS) ====================
+
 install_kenlm() {
-    log "Cloning and building KenLM..."
+    log "Building KenLM..."
     cd "$INSTALL_ROOT"
 
-    sudo apt update
-    sudo apt install libeigen3-dev
+    # macOS: use brew for build dependencies (not apt)
+    $BREW install eigen boost || true
 
-    sudo apt update
-    sudo apt install libboost-all-dev
+    if [ ! -d "$DIR_PATH/kenlm" ]; then
+        git clone https://github.com/kpu/kenlm.git "$DIR_PATH/kenlm"
+    fi
 
-    if [ -d "$KENLM_ROOT" ]; then
-        log "KenLM repository already exists."
+    cd "$DIR_PATH/kenlm"
+    if [ -d "build" ] && [ -f "build/bin/lmplz" ]; then
+        log "KenLM already built at $DIR_PATH/kenlm/build/bin"
     else
-        log "Cloning KenLM repository..."
-        git clone https://github.com/kpu/kenlm.git "$KENLM_ROOT"
+        mkdir -p build && cd build
+        cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                 -DBOOST_ROOT="${BREW_PREFIX}" \
+                 -DEigen3_DIR="${BREW_PREFIX}/share/eigen3/cmake"
+        make -j "$(sysctl -n hw.logicalcpu)"
+        log "KenLM built successfully."
     fi
-    
-    cd "$KENLM_ROOT"
-    if [ -d "build" ]; then
-        log "KenLM build directory already exists. Skipping build step."
-    else  
-        mkdir -p build
-        cd build
-        cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-        make -j $(nproc)
-    fi
-    
+
     source "$VENV_PATH/bin/activate"
-    pip install https://github.com/kpu/kenlm/archive/master.zip
-    
-    log "KenLM built successfully."
+    "$VENV_PATH/bin/pip3" install https://github.com/kpu/kenlm/archive/master.zip || \
+        log "[WARN] KenLM Python bindings install failed (binaries still usable)."
+
+    log "KenLM ready."
 }
 
-#  Install Flashlight and Flashlight-Sequence
+
+# ==================== STEP 8: Flashlight (CPU-only on macOS) ====================
+
 install_flashlight() {
-    log "--- Installing Flashlight (Text and Sequence) ---"
-    cd "$INSTALL_ROOT"
-
-    sudo apt-get install pybind11-dev
-
-    # Ensure  nvcc is installed to before proceeding with GPU build
-    log "Activating virtual environment: $VENV_PATH"
+    log "--- Installing Flashlight (CPU-only for macOS) ---"
     source "$VENV_PATH/bin/activate"
 
-    # Install flashlight-text (Python-only package)
-    log "Installing flashlight-text Python package..."
-    pip install flashlight-text \
+    # Install both flashlight packages from PyPI (much simpler than building from source)
+    log "Installing flashlight-text from PyPI..."
+    "$VENV_PATH/bin/pip3" install flashlight-text \
         || { log "[ERROR] Failed to install flashlight-text."; exit 1; }
 
-    # Clone or update the sequence repository
-    if [ -d "$FLASHLIGHT_SEQ_ROOT" ]; then
-        log "Flashlight sequence repository already exists. Updating..."
-        cd "$FLASHLIGHT_SEQ_ROOT"
-        git pull || { log "[WARN] Failed to pull latest flashlight sequence changes."; }
-    else
-        log "Cloning flashlight sequence repository..."
-        git clone https://github.com/flashlight/sequence.git "$FLASHLIGHT_SEQ_ROOT" \
-            || { log "[ERROR] Failed to clone flashlight sequence."; exit 1; }
-        cd "$FLASHLIGHT_SEQ_ROOT"
-    fi
+    log "Installing flashlight-sequence from PyPI..."
+    "$VENV_PATH/bin/pip3" install flashlight-sequence \
+        || { log "[WARN] flashlight-sequence PyPI install failed; trying from source..."
+             # Fallback: build from source with cmake pre-step
+             local FLASHLIGHT_SEQ_ROOT="$INSTALL_ROOT/sequence"
+             if [ ! -d "$FLASHLIGHT_SEQ_ROOT" ]; then
+                 git clone https://github.com/flashlight/sequence.git "$FLASHLIGHT_SEQ_ROOT"
+             fi
+             cd "$FLASHLIGHT_SEQ_ROOT"
+             # Create missing version.py that setup.py expects
+             mkdir -p bindings/python/flashlight/lib/sequence
+             echo '__version__ = "0.0.0"' > bindings/python/flashlight/lib/sequence/version.py
+             USE_CUDA=0 "$VENV_PATH/bin/pip3" install . -v \
+                 || { log "[ERROR] Flashlight sequence build from source also failed."; exit 1; }
+           }
 
-    log "Configuring and Building flashlight sequence library WITH Python bindings..."
-    # Remove old build directory for a clean state
-    rm -rf build
-    mkdir build && cd build
-
- 
-    local flashlight_python_flag="-DFLASHLIGHT_BUILD_PYTHON=ON" # <--- CHECK THIS FLAG!
-    log "[INFO] Using CMake flag for Python bindings: $flashlight_python_flag (Verify this is correct!)"
-
-    # Default to CUDA-enabled build; fall back to CPU if nvcc is absent
-    local use_cuda_flag="-DFLASHLIGHT_USE_CUDA=ON"
-    export USE_CUDA=1
-
-    if ! command -v nvcc &> /dev/null; then
-        log "[INFO] nvcc not found. Switching to CPU-only build."
-        use_cuda_flag="-DFLASHLIGHT_USE_CUDA=OFF"
-        export USE_CUDA=0
-    fi
-
-    # Explicitly point CMake to the Python executable in the venv for robustness
-    local python_executable="$VENV_PATH/bin/python"
-    cmake .. -DCMAKE_BUILD_TYPE=Release \
-             -DPYTHON_EXECUTABLE="$python_executable" \
-             "$flashlight_python_flag" \
-             "$use_cuda_flag"
-
-    # Build the C++ library AND Python bindings
-    log "Building Flashlight sequence (C++ and Python)..."
-    cmake --build . --config Release --parallel "$(nproc)"
-
-    # Install the Python Bindings into the ACTIVE virtual environment
-    log "Installing Flashlight sequence Python bindings into venv..."
-    cd ..
-    pip install .
-
-    log "[PASS] Flashlight Python bindings installed via pip."
-
-    cd "$INSTALL_ROOT" # Go back to install root
-    log "Flashlight installation steps completed."
-
-    # --- Re-install fairseq AFTER Flashlight bindings are in venv ---
-    log "Re-installing fairseq to ensure it picks up Flashlight bindings..."
-    install_fairseq # Call the fairseq install function again (it will activate/deactivate venv)
-
-    log "--- Flashlight Installation Finished ---"
-    # Final deactivate handled by install_fairseq
+    log "--- Flashlight installed ---"
 }
 
-#  Download pre-trained wav2vec model
+
+# ==================== STEP 9: Download Pre-trained Model ====================
+
 download_pretrained_model() {
-    log "Downloading pre-trained wav2vec model..."
-    
+    log "Checking for pre-trained wav2vec model..."
     mkdir -p "$INSTALL_ROOT/pre-trained"
-    cd "$INSTALL_ROOT/pre-trained"
-    
+
     if [ -f "$INSTALL_ROOT/pre-trained/wav2vec_vox_new.pt" ]; then
-        log "Pre-trained model already exists. Skipping download."
+        log "Pre-trained model already exists at $INSTALL_ROOT/pre-trained/wav2vec_vox_new.pt"
     else
-        wget https://dl.fbaipublicfiles.com/fairseq/wav2vec/wav2vec_vox_new.pt
+        log "Downloading wav2vec_vox_new.pt (~3GB)..."
+        wget -P "$INSTALL_ROOT/pre-trained" \
+            https://dl.fbaipublicfiles.com/fairseq/wav2vec/wav2vec_vox_new.pt \
+            || { log "[ERROR] Model download failed."; exit 1; }
+        log "Model downloaded."
     fi
-    
-    log "Pre-trained model downloaded successfully."
 }
 
-# Download language identification model
+
+# ==================== STEP 10: Language Identification Model ====================
+
 download_languageIdentification_model() {
-    log "Downloading language identification model..."
-    
+    log "Checking for language identification model..."
     mkdir -p "$INSTALL_ROOT/lid_model"
-    cd "$INSTALL_ROOT/lid_model"
-    
+
     if [ -f "$INSTALL_ROOT/lid_model/lid.176.bin" ]; then
-        log "LID model already exists. Skipping download."
+        log "LID model already exists at $INSTALL_ROOT/lid_model/lid.176.bin"
     else
-        wget https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
+        log "Downloading lid.176.bin..."
+        wget -P "$INSTALL_ROOT/lid_model" \
+            https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin \
+            || { log "[ERROR] LID model download failed."; exit 1; }
     fi
 
     source "$VENV_PATH/bin/activate"
-    pip install fasttext
-    
-    log "Language identification model downloaded successfully."
+    "$VENV_PATH/bin/pip3" install fasttext-wheel || \
+        "$VENV_PATH/bin/pip3" install fasttext || \
+        log "[WARN] fasttext install failed. LID filtering will be skipped."
+    log "LID model ready."
 }
