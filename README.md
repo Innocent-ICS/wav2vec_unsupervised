@@ -12,8 +12,6 @@ These scripts have been tested to work reliably in a Python virtual environment 
 
 If you are a student or researcher wanting to deeply analyze how this architecture actually bridges un-paired datasets using Generative Adversarial Networks, please consult the `Learning/` directory. 
 
-*   `Learning/learning_notes.txt`: A comprehensive course-style study breakdown of the framework mathematics and adversarial data-flow.
-*   `Learning/technical_report.md`: An engineering breakdown of the Apple Silicon migration strategy, memory diagnostics, and evaluation bypass bounds.
 *   `Learning/wav2vec_u.py`: **This file was implemented completely from scratch.** By reverse engineering and stripping down the formerly obfuscated baseline code, this file independently isolates and documents the core structural boundaries of the Segmenter, Generator, and Discriminator classes.
 
 ## System Requirements
