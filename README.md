@@ -4,8 +4,17 @@ Wav2vec_unsupervised is a collection of scripts that automate running the Fairse
 
 https://github.com/facebookresearch/fairseq/blob/main/examples/wav2vec/unsupervised/README.md
 
-These scripts have been tested to work reliably in a Python virtual environment with PyTorch == 2.3.0
+These scripts have been tested to work reliably in a Python virtual environment with PyTorch == 2.3.0.
 
+**Update:** The pipeline has now been meticulously adapted to run securely and locally on **Apple Silicon (macOS M2)**, complete with custom Cython cross-computations, FAISS memory management bottlenecks resolved via decoupled python pipelines (`fast_prepare_audio.py`), and independent evaluation scripts (`compute_metrics.py`) bypassing Linux-only C++ dependencies.
+
+## Learning & Core Architecture Analysis
+
+If you are a student or researcher wanting to deeply analyze how this architecture actually bridges un-paired datasets using Generative Adversarial Networks, please consult the `Learning/` directory. 
+
+*   `Learning/learning_notes.txt`: A comprehensive course-style study breakdown of the framework mathematics and adversarial data-flow.
+*   `Learning/technical_report.md`: An engineering breakdown of the Apple Silicon migration strategy, memory diagnostics, and evaluation bypass bounds.
+*   `Learning/wav2vec_u.py`: **This file was implemented completely from scratch.** By reverse engineering and stripping down the formerly obfuscated baseline code, this file independently isolates and documents the core structural boundaries of the Segmenter, Generator, and Discriminator classes.
 
 ## System Requirements
 
